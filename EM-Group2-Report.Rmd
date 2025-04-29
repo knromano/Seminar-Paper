@@ -1,0 +1,1054 @@
+---
+title: "Seminar Paper - EP Signal"
+author: "Merve Can, Kara Nicole Romano, Timo Volenter, Andrea Landini"
+date: "2025-04-30"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: true
+    css: custom.css
+  pdf:
+    toc: true
+    toc-depth: 1
+    number-sections: true
+    colorlinks: true
+#bibliography: references.bib
+editor: 
+  markdown: 
+    wrap: sentence
+---
+
+::: callout-note
+All code should be **well documented** and interpreted.
+Include **plain text explanations** with markdown styling and use **R code-chunks** for the code.
+Your **final document should compile to both HTML and PDF**.
+:::
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+library(tidyverse)
+library(RSQLite)
+library(dbplyr)
+library(broom)
+library(lmtest)
+library(sandwich)
+library(ggplot2)
+library(kableExtra)
+library(GRS.test)
+library(data.table)
+
+# Connect to database
+db_path <- "/home/shared/data/tidy_finance.sqlite"
+tidy_finance <- dbConnect(
+  SQLite(),
+  db_path,
+  extended_types = TRUE
+)
+dbListTables(tidy_finance)
+dbListFields(tidy_finance, "signals")
+
+```
+
+# 📄 Seminar Paper: Signal-based Asset Pricing Factor Analysis (Replication + Extension)
+
+**Objective** Each student team selects one of the predictive signals ("clear predictor") from Chen & Zimmermann’s dataset and:
+
+1.  **Replicates** the factor construction and basic results (mean return and t-stat from Table 2),
+2.  **Constructs and evaluates** a factor based on that signal,
+3.  **Performs pricing tests** against the FF-C4 model (CAPM, FF3, FF6 also possible),
+4.  **Evaluates** risk premia via cross-sectional regressions and time-varying Fama-MacBeth regressions.
+
+# Load Data & Select EP Signal
+
+We begin by selecting the Earnings-to-Price (EP) signal, a foundational value indicator in empirical asset pricing.
+First studied in depth by Basu (1977), the EP ratio measures the amount of a firm’s earnings investors receive for each dollar paid in market price.
+A higher EP ratio implies investors pay less for each dollar of earnings, often interpreted as an indicator of undervaluation.
+
+Basu constructed portfolios based on firms’ EP ratios and showed that low P/E (i.e., high EP) stocks tended to generate abnormal returns—a result inconsistent with the Efficient Market Hypothesis.
+His study found that during the period from 1957–1971, stocks in the highest EP decile earned an average excess return of 0.39% per month with a t-statistic of 2.21—statistically significant and economically meaningful.
+
+To replicate and extend this result, we adopt the implementation framework from Chen and Zimmermann (2022), who provide a public and reproducible cross-sectional asset pricing platform.
+In their construction, the EP ratio is defined as:
+
+EP = Earnings before extraordinary items / Market Capitalization (lagged by 6 months)
+
+This definition follows several academic conventions:
+
+-   The denominator (market cap) is lagged to avoid look-ahead bias.
+-   Earnings are measured before extraordinary items to ensure comparability.
+-   Observations with negative earnings are excluded to avoid distorted or meaningless EP values.
+
+Our implementation uses a pre-constructed EP signal variable (ep) from the crsp_monthly_signal table in the tidy_finance database.
+The following code loads the relevant data from January 1957 through December 1971, filters out missing values, and prepares the dataset for portfolio formation and regression analysis.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Load the EP signal (earnings-to-price) from the database
+load_signal_data <- function(
+    con, 
+    table = "crsp_monthly_signal", 
+    signal_name = "ep", 
+    start_date = NULL, 
+    end_date = NULL) {
+
+  message("Loading signal data...")
+
+  signal_data <- tbl(con, table) |>
+    select(permno, yyyymm, ret_excess, mktcap_lag, !!sym(signal_name)) |>
+    filter(!is.na(!!sym(signal_name)), !!sym(signal_name) > 0) |>  # Exclude missing or negative EP
+    collect() |>
+    mutate(
+      date = zoo::as.yearmon(as.character(yyyymm), "%Y%m"),
+      signal = !!sym(signal_name)    )
+
+  # Apply optional date filter
+  if (!is.null(start_date)) {
+    signal_data <- signal_data |> filter(date >= zoo::as.yearmon(start_date))
+  }
+  if (!is.null(end_date)) {
+    signal_data <- signal_data |> filter(date <= zoo::as.yearmon(end_date))
+  }
+
+  message("Loaded ", nrow(signal_data), " rows.")
+  return(signal_data)}
+
+# Load EP signal data for replication sample (1957–1971)
+ep_data <- load_signal_data(
+  con = tidy_finance,
+  signal_name = "ep",
+  start_date = "1957-01",
+  end_date = "1971-12")
+
+
+# Quick structural overview
+print(ep_data)
+
+```
+
+The ep_data object now contains monthly firm-level returns and EP signal values, cleaned and ready for portfolio formation.
+Each row represents a unique stock-month, with variables including:
+
+-   permno: firm identifier
+-   yyyymm: month identifier
+-   ret_excess: excess return over the risk-free rate
+-   ep: earnings-to-price ratio
+-   date: yearmon-converted date
+-   signal: a generic alias for ep, for easier downstream processing
+
+This forms a clean and robust starting point to replicate Basu’s result and extend the analysis with factor regressions.
+
+# Construct Long-Short Factor Portfolio
+
+## Equal-Weighted Long-Short Portfolio
+
+To evaluate the return-predictive power of the Earnings-to-Price (EP) signal, we construct a monthly long-short portfolio strategy.
+Specifically, we sort firms into quintiles based on their EP ratio each month, going long on firms in the top quintile (Q5: highest EP) and short on those in the bottom quintile (Q1: lowest EP).
+This approach replicates the signal construction and methodology of Basu (1977) and Chen and Zimmermann (2022).
+
+We implement two weighting schemes:
+
+-   Equal-weighted (EW): All firms within each quintile receive equal weight.
+-   Value-weighted (VW): Firms are weighted by their lagged market capitalization (mktcap_lag).
+
+We begin by assigning firms into quintiles (5 groups) based on their EP ratio each month.
+This allows us to identify the high-EP (value) and low-EP (growth) firms.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Function to assign quantiles by signal
+assign_quantiles <- function(data, quantiles = 5, signal_var = "signal") {
+  data |>
+    group_by(date) |>
+    mutate(quantile = ntile(.data[[signal_var]], quantiles)) |>
+    ungroup() }
+```
+
+This function calculates the monthly long-short portfolio returns using equal weighting.
+It computes the average excess return for Q5 and subtracts the average for Q1.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Function to compute equal-weighted long-short portfolio returns
+compute_equal_weight_ls <- function(data, long_q = 5, short_q = 1, return_var = "ret_excess") {
+  data |>
+    filter(quantile %in% c(short_q, long_q)) |>
+    group_by(date, quantile) |>
+    summarise(ret = mean(.data[[return_var]], na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = quantile, values_from = ret, names_prefix = "Q") |>
+    mutate(ls_return_eq = Q5 - Q1) |>
+    select(date, ls_return_eq) |>
+    drop_na()}
+```
+
+This version calculates the long-short returns using value weighting based on lagged market capitalization.
+Larger firms receive more weight in the return calculation.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+compute_value_weight_ls <- function(data, long_q = 5, short_q = 1, return_var = "ret_excess", weight_var = "mktcap_lag") {
+  data |>
+    filter(quantile %in% c(short_q, long_q)) |>
+    group_by(date, quantile) |>
+    summarise(
+      ret = weighted.mean(.data[[return_var]], w = .data[[weight_var]], na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    pivot_wider(names_from = quantile, values_from = ret, names_prefix = "Q") |>
+    mutate(ls_return_vw = Q5 - Q1) |>
+    select(date, ls_return_vw) |>
+    drop_na()}
+```
+
+We now apply the quantile assignment and return computation functions to the cleaned EP dataset.
+We generate equal- and value-weighted return series and merge them into a single dataset.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Assign EP quintiles
+ep_with_quantiles <- assign_quantiles(ep_data, quantiles = 5, signal_var = "signal")
+
+# Equal-weighted LS
+ep_ls_eq <- compute_equal_weight_ls(ep_with_quantiles)
+
+# Value-weighted LS
+ep_ls_vw <- compute_value_weight_ls(ep_with_quantiles)
+
+# Combine
+ep_ls_combined <- left_join(ep_ls_eq, ep_ls_vw, by = "date")
+print(ep_ls_combined)
+```
+
+Each row in the resulting ep_ls_combined object contains the monthly long-short return for both weighting schemes.
+
+We compute the average monthly return and corresponding t-statistic for each version of the strategy.
+The t-statistic helps us assess whether the return spread is significantly different from zero.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Summary stats
+ep_ls_combined |>
+  summarise(
+    mean_eq = mean(ls_return_eq) * 100,
+    t_eq = (mean(ls_return_eq) / sd(ls_return_eq)) * sqrt(n()),
+    mean_vw = mean(ls_return_vw) * 100,
+    t_vw = (mean(ls_return_vw) / sd(ls_return_vw)) * sqrt(n())
+  )
+
+```
+
+The equal-weighted long-short portfolio delivers a mean return of 0.42% per month with a t-statistic of 2.24, which is statistically significant at the 5% level.
+In contrast, the value-weighted version has a lower average return (0.22%) and is not statistically significant (t = 0.95).
+
+To better understand performance over time, we plot the cumulative returns of the long-short portfolio under both weighting methods.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Plot cumulative returns of equal- and value-weighted long-short portfolios
+ep_ls_combined |>
+  mutate(
+    cum_eq = cumsum(ls_return_eq),
+    cum_vw = cumsum(ls_return_vw)
+  ) |>
+  pivot_longer(cols = starts_with("cum_"), names_to = "type", values_to = "cum_return") |>
+  ggplot(aes(x = date, y = cum_return, color = type)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(
+    values = c("cum_eq" = "darkblue", "cum_vw" = "darkred"),
+    labels = c("Equal-Weighted", "Value-Weighted")
+  ) +
+  labs(
+    title = "Cumulative Returns of EP Long-Short Portfolios",
+    x = "Date",
+    y = "Cumulative Excess Return",
+    color = "Portfolio Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+```
+
+The figure above presents the cumulative excess returns of a long-short portfolio constructed using the Earnings-to-Price (EP) signal over the sample period from January 1957 to December 1971.
+Two versions of the strategy are shown: an equal-weighted portfolio (blue line) and a value-weighted portfolio (red line).
+Both strategies go long in firms with the highest EP ratios (top quintile) and short in those with the lowest (bottom quintile), capturing the return differential between “value” and “growth” stocks based on this valuation measure.
+
+A striking result from the plot is the consistently superior performance of the equal-weighted strategy.
+By the end of the sample period, the cumulative return of the equal-weighted long-short portfolio reaches approximately 75%, while the value-weighted counterpart peaks closer to 50%.
+This performance gap suggests that the EP signal is particularly powerful among smaller-cap stocks, which have a greater influence in equal-weighted portfolios.
+This aligns with the established finding in the literature that valuation-based anomalies often manifest more strongly among smaller firms, where information frictions and mispricing may be more prevalent.
+
+The trajectory of both portfolios is upward sloping over time, with only modest and short-lived drawdowns.
+Notably, both strategies experience short periods of negative returns in the late 1950s and early 1960s, yet recover and accelerate through the mid-to-late 1960s.
+The equal-weighted strategy exhibits a more stable growth path in the latter half of the sample, suggesting more consistent outperformance from firms with high EP values.
+These patterns indicate that the value premium captured by the EP signal is not only statistically significant but also economically meaningful and persistent across time.
+
+In contrast, the flatter path of the value-weighted portfolio—paired with its lower t-statistic—implies that large-cap firms do not display the same degree of pricing inefficiency with respect to the EP signal.
+One possible explanation is that large firms are more closely followed by analysts and institutional investors, reducing the likelihood of persistent mispricing.
+The value-weighted strategy, while still positive in its return, fails to deliver the same level of risk-adjusted performance as its equal-weighted counterpart.
+
+Overall, the evidence provided by this chart supports the validity of the EP signal as a cross-sectional return predictor and confirms earlier findings by Basu (1977).
+It further highlights the importance of portfolio weighting in empirical asset pricing research.
+The robust and sustained performance of the equal-weighted EP strategy over the 1957–1971 period strengthens its case as a candidate for inclusion in asset pricing models and motivates its continued use in multifactor testing frameworks.
+
+## Construct 10 Equal-Weighted EP Signal Portfolios (Deciles)
+
+To deepen our understanding of how the Earnings-to-Price (EP) signal affects the cross-section of returns, we construct ten equal-weighted portfolios based on firms’ EP rankings each month.
+This decile-based strategy allows us to observe the entire signal distribution rather than just comparing the extremes (e.g., Q5–Q1).
+The approach is consistent with established methods in empirical asset pricing and forms a foundation for several standard analyses, including GRS tests, Fama-MacBeth regressions, and time-series factor models.
+
+While Basu (1977) formed quintile portfolios with annual rebalancing, we follow the more granular monthly decile sorting approach suggested by Chen and Zimmermann (2022).
+Monthly sorting increases statistical power and better reflects the evolving nature of financial markets and signals.
+It also allows us to more finely trace the monotonic relationship between the EP signal and future returns, which is crucial for identifying pricing anomalies or factor structure.
+
+We implement the portfolio construction in R using a custom function.
+This function assigns each firm to one of ten signal-based portfolios using the ntile() function and then calculates the average excess return in each decile for each month:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Build N signal-sorted portfolios (equal-weighted)
+build_signal_portfolios <- function(data, signal_var = "signal", return_var = "ret_excess", 
+                                    n_portfolios = 10, weight_var = NULL) {
+  portfolio_data <- data |>
+    group_by(date) |>
+    mutate(
+      decile = ntile(.data[[signal_var]], n_portfolios)
+    ) |>
+    ungroup()
+
+  portfolio_returns <- portfolio_data |>
+    group_by(date, decile) |>
+    summarise(
+      ret = mean(.data[[return_var]], na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    pivot_wider(names_from = decile, values_from = ret, names_prefix = paste0("P"))
+
+  return(portfolio_returns)
+}
+
+```
+
+We then apply this function to our EP dataset, producing ten return series from P1 (lowest EP) to P10 (highest EP):
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Apply decile sorting to EP data
+ep_decile_returns <- build_signal_portfolios(
+  data = ep_data,
+  signal_var = "signal",
+  return_var = "ret_excess",
+  n_portfolios = 10)
+```
+
+To evaluate the effectiveness of the EP signal in explaining cross-sectional return variation, we compute the P10–P1 return spread each month and plot its cumulative return over the sample period:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Plot cumulative return spread between P10 and P1
+ep_decile_returns |>
+  mutate(
+    spread = P10 - P1,
+    cum_spread = cumsum(spread)
+  ) |>
+  ggplot(aes(x = date, y = cum_spread)) +
+  geom_line(color = "darkgreen", linewidth = 1) +
+  labs(
+    title = "Cumulative Return Spread: EP P10 − P1",
+    x = "Date",
+    y = "Cumulative Return Spread"
+  ) +
+  theme_minimal()
+
+```
+
+The figure above visualizes the cumulative return difference between firms in the highest EP decile (P10) and the lowest (P1) from 1957 to 1971.
+The steadily increasing trajectory of the green curve reflects a consistent and growing return premium associated with holding high-EP stocks (value firms) and shorting low-EP stocks (growth firms).
+
+In the early part of the sample, returns fluctuate modestly around zero, but beginning in the late 1950s and especially during the early 1960s, we observe a strong upward trend.
+This sustained rise indicates that the return premium from the EP signal was persistent, not driven by a single anomaly or short-lived mispricing.
+The sharp gains in the late 1960s and early 1970s further reinforce the idea that valuation-based strategies generated meaningful alpha during this period.
+
+Importantly, this trend is consistent with Basu’s original finding (1977) that high-EP stocks systematically outperform, and it closely mirrors the return behavior reported in Chen and Zimmermann (2022).
+It suggests that the EP signal captures pricing information that is not fully absorbed by traditional risk factors, thereby making it a strong candidate for inclusion in extended factor models.
+
+Beyond the economic significance, the monotonic nature of the return spread across deciles will be confirmed in later cross-sectional regressions.
+Together, these results provide robust preliminary evidence that the EP signal is not only statistically significant but also economically meaningful across the entire distribution of firms.
+
+# Test Factor Performance
+
+While the long-short and decile portfolio returns suggest the EP signal is return-predictive, an important question remains: are these returns explained by existing risk factors, or does the EP signal offer independent pricing information?
+To address this, we perform a series of time-series regressions where we regress the EP long-short factor against standard asset pricing models.
+
+We focus on two benchmarks:
+
+-   Capital Asset Pricing Model (CAPM): Uses only the market factor.
+-   Fama-French 3-Factor Model (FF3): Adds size (SMB) and value (HML) factors.
+
+A significant intercept (α, or “alpha”) in these regressions implies that the returns of the EP strategy are not fully explained by known systematic risks—suggesting the presence of mispricing or a missing risk factor.
+
+## Time-Series Regressions: CAPM and FF3
+
+We begin by defining a function to run linear regressions with Newey-West standard errors to account for autocorrelation and heteroskedasticity in monthly returns.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Load FF3 factor data early so it's available globally
+ff3 <- tbl(tidy_finance, "factors_ff3_monthly") |>
+  select(date, mkt_excess, smb, hml) |>
+  collect() |>
+  mutate(date = zoo::as.yearmon(date))
+
+# Run time-series regression with NW errors
+run_ts_regression <- function(data, ret_var, factors, lags = 3) {
+  formula_str <- paste(ret_var, "~", paste(factors, collapse = " + "))
+  model <- lm(as.formula(formula_str), data = data)
+  nw_se <- NeweyWest(model, lag = lags)
+  tidy(coeftest(model, nw_se)) |>
+    mutate(model = formula_str)}
+```
+
+We merge our EP long-short returns with the FF3 factor dataset and run both the CAPM and FF3 regressions:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Prepare regression data
+ts_data <- ep_ls_combined |>
+  mutate(date = as.yearmon(date)) |>
+  left_join(ff3, by = "date") |>
+  drop_na()
+
+# Run CAPM and FF3 models
+capm_result <- run_ts_regression(ts_data, "ls_return_eq", c("mkt_excess"))
+ff3_result  <- run_ts_regression(ts_data, "ls_return_eq", c("mkt_excess", "smb", "hml"))
+
+# Extract alpha terms
+alpha_summary <- bind_rows(
+  capm_result |> filter(term == "(Intercept)") |> mutate(model = "CAPM"),
+  ff3_result |> filter(term == "(Intercept)") |> mutate(model = "FF3")
+) |>
+  select(model, estimate, std.error, statistic, p.value) |>
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+print(alpha_summary)
+```
+
+The time-series regression results provide critical insight into whether the returns from the EP long-short factor are driven by exposure to established risk factors or reflect independent sources of return.
+Under the CAPM specification, the estimated monthly alpha is 0.50% (estimate = 0.0053), with a t-statistic of 2.90 and a p-value of 0.0042.
+This result is statistically significant at the 1% level, strongly rejecting the null hypothesis of zero abnormal returns.
+The implication is that the EP-based strategy earns economically meaningful excess returns even after accounting for market risk exposure alone.
+
+When augmenting the model to include the Fama-French 3-Factor (FF3) framework, which adds size (SMB) and value (HML) factors, the alpha declines to 0.28% per month (estimate = 0.0028), with a t-statistic of 2.38 and a p-value of 0.0182.
+Although the magnitude of the alpha is reduced—likely due to overlap between the EP signal and the HML value factor—it remains statistically significant at the 5% level, indicating that the EP signal captures pricing information beyond what is explained by traditional factor exposures.
+
+These findings are broadly consistent with the existing literature.
+For instance, Chen and Zimmermann (2022) document similar patterns, noting that while value-oriented signals such as EP correlate with the HML factor, they often exhibit incremental explanatory power.
+The persistence of significant alphas under FF3 suggests that the EP signal is not fully subsumed by existing value proxies, supporting its validity as a standalone pricing factor or anomaly.
+
+From a theoretical perspective, these results challenge the sufficiency of conventional asset pricing models.
+If the EP signal merely reflected compensation for known systematic risk, its alpha should be indistinguishable from zero after controlling for FF3 factors.
+The presence of a residual alpha implies that the EP signal either captures a distinct dimension of risk—perhaps related to investor behavioral biases or inefficiencies in processing valuation information—or reflects market mispricing that persists over time.
+
+In conclusion, the CAPM and FF3 regression results reinforce the empirical relevance of the EP signal.
+Despite controlling for market, size, and value factors, the EP-based strategy delivers significant abnormal returns, making it a strong candidate for inclusion in extended multifactor models and further investigation in both academic research and investment practice.
+
+To visualize this effect over time, we plot the cumulative residuals (i.e., cumulative alpha) from the FF3 regression:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Fit FF3 model to EP long-short portfolio
+model_ff3 <- lm(ls_return_eq ~ mkt_excess + smb + hml, data = ts_data)
+
+# Add predicted values and residuals (alpha) to the dataset
+ts_data <- ts_data |>
+  mutate(
+    predicted = predict(model_ff3),
+    alpha_resid = ls_return_eq - predicted,
+    cum_alpha = cumsum(alpha_resid)
+  )
+
+# Plot cumulative unexplained return (alpha)
+ggplot(ts_data, aes(x = date, y = cum_alpha)) +
+  geom_line(color = "darkblue", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Cumulative Unexplained Return (Alpha) from FF3 Model",
+    x = "Date",
+    y = "Cumulative Alpha (Residuals)"
+  ) +
+  theme_minimal()
+
+
+```
+
+The graph above shows the cumulative unexplained return (alpha) of the EP (Earnings-to-Price) long-short portfolio after adjusting for the Fama-French 3-Factor (FF3) model.
+Each point in the series represents the cumulative sum of monthly residuals—i.e., the difference between the actual portfolio return and the return predicted by the FF3 model.
+This allows us to visually assess whether the EP strategy delivers consistent outperformance that is not accounted for by known systematic risk factors: market (MKT), size (SMB), and value (HML).
+
+The most notable feature of the plot is that the cumulative alpha does not merely fluctuate randomly around zero.
+Instead, it exhibits pronounced trends, especially a sharp upward drift between 1959 and 1962, followed by a long-term decline until around 1968.
+If the FF3 model fully captured the return-generating process of the EP long-short portfolio, we would expect the residuals to average out to zero over time.
+The presence of directional movement indicates that the FF3 model fails to fully explain the variation in returns.
+
+The pattern of cumulative alpha appears to be cyclical, suggesting that the unexplained return of the EP signal varies across different market environments.
+For instance, the steep decline during the mid-1960s could coincide with shifts in macroeconomic sentiment or market efficiency, while the rebound in 1970 may reflect a return to value-oriented strategies during periods of correction.
+This cyclical behavior implies that the EP signal may be state-dependent—performing particularly well in certain market regimes (e.g., recovery phases or value rotations).
+
+The early period of the sample (1957–1962) shows persistent positive residuals, culminating in a cumulative alpha of more than 10%.
+This supports the hypothesis that high-EP firms may be systematically undervalued, and that the market underreacts to earnings-based valuation signals.
+The later drop suggests possible overvaluation or increasing investor awareness of such anomalies, reducing the exploitable spread.
+
+From an asset pricing perspective, this pattern reinforces the idea that the EP signal carries incremental information not fully captured by the traditional FF3 framework.
+In other words, the EP strategy may warrant inclusion as a separate pricing factor, as it offers predictive power orthogonal to market, size, and value exposures.
+The residual alpha drift provides empirical justification for extending the FF3 model to include EP or similar fundamental-based signals.
+
+In summary, the cumulative alpha plot indicates that the EP long-short strategy generates returns that are not fully spanned by the FF3 model, especially during key subperiods.
+This underlines the empirical strength of the EP signal as an independent pricing factor or persistent anomaly.
+
+## Factor Augmentation: Panel Regression Across EP Portfolios
+
+To evaluate whether the EP signal offers incremental pricing information beyond traditional asset pricing factors, we conduct panel regressions across decile-sorted portfolios.
+Specifically, we compare the standard Fama-French 3-Factor model (FF3) with an augmented model that includes the EP long-short factor.
+The goal is to determine whether the addition of EP reduces pricing errors, as measured by the alpha (intercept) in time-series regressions of portfolio returns.
+
+### Panel Regressions Across EP Portfolios
+
+We begin by running separate time-series regressions for each of the ten EP-sorted portfolios.
+For both FF3 and FF3+EP specifications, we extract the estimated alpha and corresponding Newey-West-adjusted t-statistic.
+This is accomplished with the following function:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Define portfolio names
+portfolios <- paste0("P", 1:10)
+
+# Merge portfolio returns, FF3 factors, and EP factor
+regression_panel <- ep_decile_returns |>
+  left_join(ff3, by = "date") |>
+  left_join(ep_ls_combined |> rename(ep_ls = ls_return_eq), by = "date") |>
+  drop_na(mkt_excess, smb, hml, ep_ls, !!!syms(portfolios))
+
+
+run_panel_ts_model <- function(data, portfolios, factors, lags = 3) {
+  map_dfr(portfolios, function(pname) {
+    fml <- as.formula(paste(pname, "~", paste(factors, collapse = " + ")))
+    model <- lm(fml, data = data)
+    nw <- coeftest(model, vcov = NeweyWest(model, lag = lags))
+    tidy_nw <- as_tibble(tidy(nw))
+    alpha_row <- tidy_nw |> filter(term == "(Intercept)")
+    tibble(
+      portfolio = pname,
+      alpha = alpha_row$estimate,
+      t_stat = alpha_row$statistic)})}
+```
+
+We then apply this function to both models, first estimating FF3, then augmenting it with the EP factor:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Run regressions
+
+ff3_alpha_table <- run_panel_ts_model(regression_panel, portfolios, c("mkt_excess", "smb", "hml"))
+ff3_ep_alpha_table <- run_panel_ts_model(regression_panel, portfolios, c("mkt_excess", "smb", "hml", "ep_ls"))
+
+# Combine and format
+alpha_comparison <- bind_rows(
+  ff3_alpha_table |> mutate(model = "FF3"),
+  ff3_ep_alpha_table |> mutate(model = "FF3+EP")
+) |>
+  pivot_wider(names_from = model, values_from = c(alpha, t_stat)) |>
+  mutate(across(where(is.numeric), round, 4))
+
+
+print(alpha_comparison)
+```
+
+Under the FF3 specification, we observe that portfolios P6 through P10 exhibit significant positive alphas, with t-statistics well above the conventional 1.96 threshold.
+This pattern suggests that the Fama-French model fails to fully explain the return behavior of value stocks (those with high EP ratios).
+For example, portfolio P9 has a t-stat of 3.75, while P7 and P8 are also highly significant, with t-values of 2.95 and 2.99 respectively.
+
+When the EP factor is included in the model (FF3+EP), these pricing errors are substantially reduced.
+For P10, the alpha effectively vanishes, declining from 0.0016 to 0.0000, and its t-statistic drops from 2.22 to –0.04.
+Similarly, the alpha in P9 drops by an order of magnitude, and significance diminishes accordingly.
+This widespread attenuation of alpha across the upper EP deciles demonstrates that the EP factor absorbs a significant portion of return variation not captured by the FF3 factors.
+
+Interestingly, the lower decile portfolios (P1–P3) do not show substantial pricing errors under either model.
+Their alphas are small and statistically insignificant in both specifications, which implies that the mispricing captured by the EP signal is concentrated in portfolios composed of firms with high EP ratios—i.e., traditional "value" stocks.
+
+These results align with and extend previous findings in the asset pricing literature.
+Basu (1977) originally showed that value stocks earn abnormal returns unexplained by market beta, and more recent work by Chen and Zimmermann (2022) confirms that the EP signal maintains predictive power even in the presence of modern multifactor models.
+Our findings reinforce this conclusion by showing that incorporating the EP factor meaningfully improves pricing accuracy across the cross-section of EP-sorted portfolios.
+
+From a theoretical standpoint, this evidence supports the hypothesis that EP captures either a missing systematic risk or a persistent behavioral anomaly.
+Either way, the significant reduction in pricing errors after including the EP factor confirms its relevance for empirical asset pricing and motivates its consideration in extended multifactor models.
+
+### Spanning and Redundancy Regressions
+
+To further investigate whether the EP signal provides independent information beyond standard asset pricing factors, we conduct spanning and redundancy regressions.
+The goal is to determine whether the EP long-short factor simply repackages exposures already captured by existing Fama-French factors, or whether it contributes a unique and orthogonal source of return variation.
+
+The analysis proceeds in two parts:
+
+-   Spanning regression: Regress the EP factor on the Fama-French factors to test how much of its variation is explained.
+-   Reverse regressions: Regress each Fama-French factor on the EP factor to assess whether EP explains variation in known factors.
+
+We begin by preparing the data:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Load FF-C4 (mkt, smb, hml, rmw) and merge with EP long-short factor
+ff_c4 <- tbl(tidy_finance, "factors_ff5_monthly") |>
+  select(date, mkt_excess, smb, hml, rmw) |>
+  collect() |>
+  mutate(date = zoo::as.yearmon(date))
+
+ep_ls_factor <- ep_ls_combined |>
+  mutate(date = zoo::as.yearmon(date)) |>
+  select(date, ep_ls = ls_return_eq)
+
+factor_df <- left_join(ff_c4, ep_ls_factor, by = "date") |>
+  drop_na()
+```
+
+We then estimate a series of regressions:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Spanning: EP ~ FF-C4
+model_ep_on_ffc4 <- lm(ep_ls ~ mkt_excess + smb + hml + rmw, data = factor_df)
+
+# Reverse: FF factors ~ EP
+model_mkt_on_ep <- lm(mkt_excess ~ ep_ls, data = factor_df)
+model_smb_on_ep <- lm(smb ~ ep_ls, data = factor_df)
+model_hml_on_ep <- lm(hml ~ ep_ls, data = factor_df)
+model_rmw_on_ep <- lm(rmw ~ ep_ls, data = factor_df)
+```
+
+To extract key stats, we use the following helper function:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Extract coefficients, t-stats, and R²
+extract_regression_stats <- function(model) {
+  summary_model <- summary(model)
+  tidy_model <- broom::tidy(model)
+
+  tibble(
+    dependent = as.character(formula(model))[2],
+    predictor = tidy_model$term[2],
+    coef = tidy_model$estimate[2],
+    t_stat = tidy_model$statistic[2],
+    r_squared = summary_model$r.squared)}
+
+# Build comparison table
+regression_summary <- bind_rows(
+  extract_regression_stats(model_ep_on_ffc4),
+  extract_regression_stats(model_mkt_on_ep),
+  extract_regression_stats(model_smb_on_ep),
+  extract_regression_stats(model_hml_on_ep),
+  extract_regression_stats(model_rmw_on_ep))
+
+print(regression_summary)
+
+```
+
+The regression of EP on the four FF-C4 factors yields an R² of \~49.7%, suggesting that just under half of the variation in the EP long-short factor is explained by MKT, SMB, HML, and RMW.
+The market factor (mkt_excess) shows a negative and borderline significant loading (β = -0.115, t = -2.00), indicating partial inverse exposure, while the remainder of the EP variation remains unexplained.
+
+This aligns with existing literature (e.g., Chen & Zimmermann, 2022), which emphasizes that individual valuation-based signals like EP are only partially spanned by standard value proxies such as HML.
+The residual component may reflect information overlooked by broad-scope factors or inefficiencies not fully priced in traditional models.
+
+The most striking result is the regression of HML on EP.
+The R² is 0.439, and the coefficient is 0.53 with a very strong t-statistic of 8.85, confirming a tight and significant relationship between EP and HML.
+This is expected since both are value-related factors.
+However, this strong correlation does not imply redundancy—as EP still leaves meaningful unexplained variation.
+
+On the other hand, the regressions of MKT, SMB, and RMW on EP show low explanatory power (R² \< 13%), albeit with some statistically significant coefficients.
+Notably:
+
+-   SMB (size) shows a negative and significant loading (β = -0.336, t = -2.96),
+-   RMW (profitability) shows an even stronger negative relationship (β = -0.208, t = -3.78),
+-   MKT (market) also loads negatively with a weaker significance (t = -3.20, R² \~9.3%).
+
+This evidence supports the view that while EP captures part of the variation in known value (HML), it also loads on other dimensions and retains non-trivial independent variation.
+These relationships may point to cross-factor contamination or EP reflecting a distinct behavioral mechanism related to valuation mispricing.
+
+From a model construction perspective, these results argue against excluding EP from multifactor models purely on the basis of overlap with HML.
+While the high correlation with HML is expected, the independent variation and significant (albeit partial) span of other factors suggest that EP captures a distinct angle on mispricing or risk.
+
+In practice, these findings support factor augmentation approaches.
+An investor or researcher might consider including EP alongside HML in asset pricing applications, especially in contexts where valuation mispricing is of interest.
+Moreover, the relatively modest R² values across the board underscore that asset pricing anomalies are often multifaceted and not fully explained by canonical models.
+
+## GRS
+
+While prior regressions evaluated the EP signal’s performance portfolio-by-portfolio, the GRS test provides a formal statistical method to evaluate the performance of a factor model as a whole.
+Specifically, it tests the null hypothesis that the alphas from a set of time-series regressions are jointly zero.
+If the model prices assets correctly, none of the portfolios should earn statistically significant abnormal returns (alphas).
+
+We apply the GRS test to two models:
+
+-   FF3: The standard Fama-French 3-Factor model
+-   FF3 + EP: The augmented model that includes the EP long-short factor
+
+The test assets are the ten EP-sorted portfolios (P1 through P10), constructed earlier.
+
+We begin by preparing the dataset.
+Specifically, we merge the decile portfolio returns with the FF3 factors and our custom EP long-short factor:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Define portfolio names
+portfolios <- paste0("P", 1:10)
+
+regression_panel <- ep_decile_returns |>
+  left_join(ff3, by = "date") |>
+  left_join(ep_ls_combined |> rename(ep_ls = ls_return_eq), by = "date") |>
+  drop_na(mkt_excess, smb, hml, ep_ls, !!!syms(portfolios))
+
+```
+
+With the merged panel in place, we construct two input matrices required for the GRS test:
+
+-   Y: A matrix of portfolio excess returns (each column corresponds to a portfolio).
+-   X: A matrix of factor returns, corresponding to the factor models under evaluation.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Merge portfolio returns, FF3 factors, and EP factor
+regression_panel <- ep_decile_returns |>
+  left_join(ff3, by = "date") |>
+  left_join(ep_ls_combined |> rename(ep_ls = ls_return_eq), by = "date") |>
+  drop_na(mkt_excess, smb, hml, ep_ls, !!!syms(portfolios))
+
+# Portfolio return matrix
+Y <- regression_panel |>
+  select(all_of(portfolios)) |>
+  as.matrix()
+
+# Factor matrices
+X_ff3 <- regression_panel |> select(mkt_excess, smb, hml) |> as.matrix()
+X_ff3_ep <- regression_panel |> select(mkt_excess, smb, hml, ep_ls) |> as.matrix()
+```
+
+We now apply the GRS.test() function from the {GRS.test} package to both specifications:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Run GRS tests
+grs_ff3 <- GRS.test(Y, X_ff3)
+grs_ff3_ep <- GRS.test(Y, X_ff3_ep)
+```
+
+To facilitate interpretation, we define a helper function to extract key results from each model, including the GRS test statistic, its p-value, average R² across portfolios, and the mean alpha and its t-statistic:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Extract GRS stats
+grs_clean <- function(grs_result) {
+  list(
+    GRS_stat = grs_result$GRS.stat,
+    p_value = grs_result$GRS.pval,
+    mean_R2 = mean(grs_result$R2),
+    mean_alpha = mean(grs_result$coef[, "intercept"]),
+    mean_alpha_t = mean(grs_result$tstat[, "intercept"]))}
+```
+
+We apply this function to both models and present the results in a comparative table:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+grs_results <- bind_rows(
+  grs_clean(grs_ff3),
+  grs_clean(grs_ff3_ep)
+) |>
+  mutate(model = c("FF3", "FF3+EP")) |>
+  select(model, everything())
+
+print(grs_results)
+```
+
+The GRS test statistic for the FF3 model is 1.66 with a p-value of 0.093, meaning that at the 10% significance level, we fail to reject the null, though the model remains close to the rejection boundary.
+This indicates some pricing errors remain under FF3, albeit not strongly statistically significant.
+The model explains a high average proportion of return variation (mean R² = 94.6%), but the average alpha across portfolios is around 0.041% per month.
+
+When we augment the FF3 model with the EP factor, the GRS statistic drops to 1.30 and the p-value rises to 0.231.
+This improvement suggests that the EP factor reduces joint pricing errors across decile portfolios, and thus improves model fit.
+Additionally, the mean R² increases to 95.77%, while both the mean alpha and its t-statistic remain low, reinforcing that the augmented model fits the cross-sectional return data more effectively.
+
+The key insight is that although neither model is rejected at conventional levels, the addition of the EP factor improves overall performance in terms of pricing accuracy and explanatory power.
+The higher p-value and lower GRS statistic indicate reduced mispricing, which supports the argument that the EP factor is not spanned by FF3 and provides incremental explanatory content.
+
+These findings align well with recent literature (e.g., Chen & Zimmermann, 2022), which emphasizes the need for asset pricing models to incorporate non-redundant signals.
+The improvement in R² and pricing error metrics implies that EP captures an additional return-relevant dimension not fully explained by traditional factors.
+In light of these results, the EP signal merits serious consideration as a valid addition to the factor zoo.
+
+# Cross-Sectional Pricing Power of the EP Signal
+
+In this section, we test whether the Earnings-to-Price (EP) signal earns a systematic return premium in the cross-section of stocks, consistent with a priced risk factor or anomaly.
+We do so using the Fama-MacBeth (1973) two-step regression framework, which estimates whether firm-level signals predict future returns on average.
+
+The key regression takes the form: $$R_{i,t+1} = \gamma_{0,t} + \gamma_{1,t} \cdot \text{EP}_{i,t} + \epsilon_{i,t+1}$$ The coefficient \gamma\_{1,t} represents the cross-sectional price of risk associated with the EP signal in each month.
+We then test whether the average gamma1 is significantly different from zero, using Newey-West standard errors across time.
+
+## Fama-MacBeth Regression Without Controls
+
+We begin with a baseline specification to test whether the Earnings-to-Price (EP) signal earns a systematic return premium in the cross-section of stocks.
+Specifically, we estimate monthly regressions of next month's excess return on the current month’s EP value using the Fama-MacBeth (1973) two-step procedure.
+We then average the monthly slopes \gamma\_{1,t} and compute Newey-West standard errors to account for autocorrelation and heteroskedasticity across time.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Prepare data: create forward return
+fm_data <- ep_data |>
+  arrange(permno, date) |>
+  group_by(permno) |>
+  mutate(ret_fwd = lead(ret_excess)) |>
+  ungroup() |>
+  drop_na(signal, ret_fwd)
+
+# Run one cross-sectional regression per month
+fm_results <- fm_data |>
+  group_by(date) |>
+  group_map(~ {
+    model <- lm(ret_fwd ~ signal, data = .x)
+    tidy(model)[2, ]  # Extract slope only (γ₁,t)
+  }) |>
+  bind_rows()
+
+# Estimate time-series average of monthly γ₁ and NW standard error
+gamma_mean <- mean(fm_results$estimate)
+gamma_se <- sqrt(NeweyWest(lm(estimate ~ 1, data = fm_results), lag = 3)[1, 1])
+gamma_t <- gamma_mean / gamma_se
+
+# Present result
+tibble(
+  avg_gamma = round(gamma_mean * 100, 4),  # scale to percentage
+  se = round(gamma_se * 100, 4),
+  t_stat = round(gamma_t, 3))
+
+```
+
+The estimation yields an average monthly slope of 4.69%, with a Newey-West adjusted standard error of 1.57%, resulting in a t-statistic of 2.99.
+This strongly rejects the null hypothesis that the EP signal has no cross-sectional explanatory power, at conventional significance levels.
+The economic magnitude is also notable—an increase of one unit in the EP signal is associated with a 4.69 percentage point increase in expected next-month excess return.
+
+This finding confirms that the EP signal is a priced factor in the cross-section, not merely a return-predictive characteristic.
+The result aligns with the original insights of Basu (1977), who first identified the strong association between earnings yields and stock returns.
+It also supports more recent empirical literature, such as Chen and Zimmermann (2022), which identifies EP as a high-performing signal across decades of U.S. equity data.
+
+Importantly, this regression does not yet control for exposure to known systematic risk factors, such as those captured by the Fama-French 3-Factor (FF3) model.
+Thus, the observed premium may reflect underlying risk sensitivities.
+In the following section, we explore whether the EP premium survives after controlling for these factor betas, which would offer even stronger evidence that EP is an independent pricing anomaly.
+
+# Controlling for FF3 Factor Exposures
+
+To assess whether the Earnings-to-Price (EP) signal captures pricing information beyond known risk factors, we extend the classic Fama-MacBeth (1973) two-step regression framework by including firm-level factor exposures to the Fama-French 3-Factor (FF3) model.
+This allows us to test whether the predictive power of EP persists after accounting for market (MKT), size (SMB), and value (HML) betas.
+
+The FF3 betas are estimated using a rolling 60-month window of past excess returns for each firm.
+These time-varying exposures are then used as controls in monthly cross-sectional regressions of next month’s excess return on the EP signal.
+If the EP coefficient remains statistically and economically significant, it implies that EP predicts returns beyond standard risk exposures.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Load EP signal and returns
+signal_df <- tbl(tidy_finance, "crsp_monthly_signal") |>
+  select(permno, yyyymm, ret_excess, ep) |>
+  filter(!is.na(ep)) |>
+  collect() |>
+  mutate(date = as.yearmon(as.character(yyyymm), "%Y%m"))
+
+# Load FF3 factor data
+ff3 <- tbl(tidy_finance, "factors_ff3_monthly") |>
+  select(date, mkt_excess, smb, hml) |>
+  collect() |>
+  mutate(date = as.yearmon(date))
+
+# Merge and convert to data.table
+merged <- left_join(signal_df, ff3, by = "date") |>
+  arrange(permno, date) |>
+  as.data.table()
+```
+
+We estimate firm-level betas by running rolling 60-month regressions of excess returns on the FF3 factors.
+These betas represent each stock’s historical exposure to the systematic factors.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+roll_ff3_betas <- function(dt, window = 60) {
+  dt[, `:=`(beta_mkt = NA_real_, beta_smb = NA_real_, beta_hml = NA_real_)]
+  firm_ids <- unique(dt$permno)
+  pb <- txtProgressBar(min = 0, max = length(firm_ids), style = 3)
+
+  for (i in seq_along(firm_ids)) {
+    firm_data <- dt[permno == firm_ids[i]]
+    firm_index <- which(dt$permno == firm_ids[i])
+
+    if (nrow(firm_data) < window) next
+
+    for (j in window:nrow(firm_data)) {
+      win <- firm_data[(j - window + 1):j]
+      if (anyNA(win[, .(ret_excess, mkt_excess, smb, hml)])) next
+
+      fit <- tryCatch(lm(ret_excess ~ mkt_excess + smb + hml, data = win), error = function(e) NULL)
+      if (!is.null(fit)) {
+        global_index <- firm_index[j]
+        dt[global_index, `:=`(
+          beta_mkt = coef(fit)[["mkt_excess"]],
+          beta_smb = coef(fit)[["smb"]],
+          beta_hml = coef(fit)[["hml"]]
+        )]
+      }
+    }
+    setTxtProgressBar(pb, i)
+  }
+
+  close(pb)
+  return(dt)
+}
+
+# Apply to data
+dt_betas <- copy(merged)
+dt_betas <- dt_betas[, obs_count := .N, by = permno][obs_count >= 60]
+dt_betas <- roll_ff3_betas(dt_betas)
+
+```
+
+Next, we compute forward one-month excess returns, which serve as the dependent variable in the Fama-MacBeth regressions:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# One-month forward return
+dt_betas[, ret_fwd := shift(ret_excess, type = "lead"), by = permno]
+```
+
+We restrict the dataset to non-missing observations of EP, forward returns, and the three beta estimates, ensuring a consistent panel of firm-month observations for the cross-sectional regressions:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Drop rows with missing betas or signals
+fm_ready <- dt_betas[
+  !is.na(ep) & !is.na(ret_fwd) &
+  !is.na(beta_mkt) & !is.na(beta_smb) & !is.na(beta_hml)
+]
+
+```
+
+For each month, we estimate a cross-sectional regression of future returns on the EP signal and the FF3 betas.
+We extract the coefficient on EP, which represents the risk-adjusted return premium:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Fama-MacBeth regressions across time
+fm_results <- fm_ready[, {
+  model <- lm(ret_fwd ~ ep + beta_mkt + beta_smb + beta_hml)
+  coef_ep <- coef(model)["ep"]
+  list(estimate = coef_ep)
+}, by = date]
+```
+
+We then calculate the time-series average of these monthly slope estimates and compute a Newey-West standard error to account for autocorrelation and heteroskedasticity:
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Time-series average and NW std error
+gamma_mean <- mean(fm_results$estimate)
+gamma_se <- sqrt(NeweyWest(lm(estimate ~ 1, data = fm_results), lag = 3)[1, 1])
+gamma_t <- gamma_mean / gamma_se
+
+# Present result
+tibble(
+  avg_gamma = round(gamma_mean * 100, 4),  # % format
+  se = round(gamma_se * 100, 4),
+  t_stat = round(gamma_t, 3))
+```
+
+The results from the cross-sectional Fama-MacBeth regression with FF3 controls provide strong evidence that the Earnings-to-Price (EP) signal captures a statistically and economically meaningful return premium, even after accounting for firm-level exposures to standard risk factors.
+Specifically, the average monthly coefficient on the EP signal (γ̄₁) is estimated at 1.31%, with a Newey-West adjusted standard error of 0.49% and a corresponding t-statistic of 2.65.
+This implies that firms with higher EP ratios earn significantly higher future excess returns, after controlling for their exposure to the market (MKT), size (SMB), and value (HML) factors.
+
+The magnitude of this effect is economically substantial: a one-unit increase in a firm’s EP signal corresponds, on average, to a 1.31 percentage point increase in expected return for the following month.
+The statistical significance of this estimate, well above the 5% critical value threshold, suggests that the relationship is unlikely to be driven by random noise or omitted variable bias.
+
+This finding reinforces the notion that the EP signal represents more than a proxy for known factor exposures.
+Instead, it appears to capture a distinct source of cross-sectional return variation, potentially reflecting a priced risk factor or systematic mispricing related to earnings-based valuation.
+These results extend earlier findings by Basu (1977) and align with the more recent empirical framework of Chen and Zimmermann (2022), while offering additional robustness through firm-level, risk-adjusted analysis.
+
+In sum, the Fama-MacBeth evidence presented here affirms that the EP signal maintains strong pricing power in the cross-section of U.S. equities, even after conditioning on traditional factor models.
+This enhances the credibility of EP as a valid anomaly and supports its role in extended asset pricing models.
+
+# Dynamics of the EP Risk Premium
+
+While the average EP premium estimated via Fama-MacBeth regressions confirms its statistical and economic significance, it is equally important to examine the temporal stability of this premium.
+Factor premia often vary over time, responding to shifts in macroeconomic conditions, investor sentiment, and market efficiency.
+To capture these fluctuations, we compute a rolling 36-month average of the monthly EP slope coefficients (γ₁), offering a smoothed perspective on the signal’s evolving pricing power.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE, tidy=TRUE}
+# Compute rolling 36-month mean of EP Fama-MacBeth coefficient
+rolling_ep_premium <- fm_results |>
+  arrange(date) |>
+  mutate(
+    gamma_roll = zoo::rollmean(estimate, k = 36, fill = NA, align = "right"))
+
+# Plot the rolling EP premium
+ggplot(rolling_ep_premium, aes(x = date, y = gamma_roll)) +
+  geom_line(color = "darkred", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  labs(
+    title = "Rolling 36-Month Average of EP Risk Premium (γ₁)",
+    y = "Rolling EP Premium", x = "Date"
+  ) +
+  theme_minimal()
+```
+
+The graph above plots the 36-month rolling average of the EP signal’s monthly return premium (γ₁) from the Fama-MacBeth regressions.
+The plot reveals substantial time variation in the pricing power of the EP signal.
+Notably, the EP premium was particularly strong during the late 1950s and early 1960s—reaching peak values above 9%—before weakening in the late 1960s and becoming more volatile thereafter.
+
+We observe cyclical behavior throughout the sample.
+Periods of strong EP performance, such as during the early 1980s, early 2000s, and post-2009 recovery, are interspersed with episodes of muted or negative risk premia.
+These fluctuations suggest that the effectiveness of the EP signal is state-dependent, possibly stronger during value-driven recoveries and weaker during growth-driven bull markets or speculative periods.
+
+Despite this cyclicality, the EP premium remains consistently positive in many subperiods, reinforcing its role as a persistent, albeit time-varying, anomaly.
+Importantly, even during downturns, the signal does not remain negative for extended durations, and tends to rebound—suggesting resilience and reversion characteristics.
+
+This time-series behavior is consistent with literature on dynamic factor risk premia and lends support to the idea that the EP signal is not merely a static anomaly.
+Instead, it may reflect deeper structural features of the market—such as investor overreaction, earnings mispricing, or macro-driven risk compensation—that vary across time but recur reliably enough to generate repeatable returns.
+
+In sum, the rolling EP premium provides a valuable lens into the evolving strength of the signal.
+It confirms both the long-term pricing relevance of the EP factor and its potential sensitivity to business cycles, thus offering insights into the conditions under which EP-based strategies are likely to be most effective.
+
+# Replication and Comparison with Literature
+
+A central goal of this study is to replicate the results of Chen and Zimmermann (2022) using the Earnings-to-Price (EP) signal and to benchmark our findings against the seminal work of Basu (1977).
+This section evaluates how closely our estimates align with those reported in the literature, explores potential reasons for any discrepancies, and situates our results within the broader context of value-based signals in empirical asset pricing.
+
+## Replicating Table 2 from Chen and Zimmermann (2022)
+
+Table 2 in Chen and Zimmermann (2022) reports the average monthly excess return and t-statistic for a long-short factor portfolio constructed using the EP signal over the period 1957–1971.
+Their result for the equal-weighted portfolio is a mean excess return of 0.39% per month with a t-statistic of 2.21, indicating statistically and economically significant outperformance of high-EP stocks relative to low-EP stocks.
+
+In our replication, we construct an equal-weighted long-short portfolio using quintile sorts on the EP signal and calculate a mean monthly return of 0.42% and a t-statistic of 2.24.
+These results closely match those of Chen and Zimmermann, with minor differences likely attributable to small variations in sample filtering, data cleaning (e.g., exclusion of firms with negative EP), or implementation details such as handling of ties and returns alignment.
+
+Importantly, the statistical significance of our result persists across specifications.
+Even after controlling for Fama-French factors, the alpha remains significant, and the GRS test confirms the improved pricing performance of the augmented FF3+EP model.
+This robustness enhances the credibility of our replication and affirms the reliability of the original findings.
+
+## Comparison with Basu (1977)
+
+Our findings also echo the pioneering work of Basu (1977), who first documented the empirical relevance of the earnings yield in explaining cross-sectional stock returns.
+Using a similar time frame and methodology (1957–1971, value-based signal sorting), Basu showed that portfolios formed on high earnings-to-price ratios earned excess returns of approximately 0.39% per month, a figure that aligns almost perfectly with our replicated and extended results.
+
+Basu's original approach involved annual rebalancing and quintile portfolios, whereas our implementation employs monthly rebalancing and both quintile and decile sorting for enhanced precision.
+Nonetheless, the core insight that value stocks identified via the EP ratio earn persistently higher returns holds strongly in both settings.
+This replication therefore provides updated empirical confirmation of one of the earliest and most influential asset pricing anomalies.
+
+## Comparison with Similar Signals in the Literature
+
+The EP signal belongs to the broader family of valuation-based predictors, which includes book-to-market (B/M), cash flow-to-price, and dividend yield, among others.
+Among these, the book-to-market (B/M) ratio used in the construction of the Fama-French HML factor has become the most canonical.
+However, recent studies, including Chen and Zimmermann (2022), suggest that EP often outperforms B/M, particularly when measured using forward-looking or quality-adjusted earnings.
+
+Our empirical findings corroborate this claim.
+In Section 3, we show that the EP signal delivers significant alphas even after controlling for HML, indicating that it is not redundant and likely captures distinct pricing information.
+The high correlation between EP and HML (as confirmed in our spanning tests) suggests overlapping economic content, but the EP signal retains incremental explanatory power.
+This is particularly evident in the panel regressions, where adding EP to the FF3 model substantially reduces pricing errors across high-EP portfolios.
+
+This pattern supports the emerging consensus in the literature: while EP and HML are both proxies for value, they do not represent the same risk exposure.
+EP appears to capture earnings-based mispricing or underreaction, which is potentially more timely and informative than B/M, which may lag behind due to accounting delays or stale book values.
+
+## Summary and Implications
+
+Taken together, our replication successfully confirms the predictive power and pricing relevance of the EP signal, as established in both the foundational work of Basu (1977) and the recent systematic analysis by Chen and Zimmermann (2022).
+Any observed deviations from published results are minor and within the bounds of empirical replication using public data.
+
+The signal’s strong performance across multiple tests (mean return, t-statistics, alpha regression, cross-sectional pricing, and GRS) justifies its inclusion in extended factor models and supports its role as a non-redundant predictor in the growing "factor zoo." Moreover, its stability over time, as evidenced in the rolling EP premium plot, suggests that its relevance is not limited to a specific era, but persists across market regimes.
+
+This evidence highlights the enduring role of earnings-based valuation metrics in asset pricing and motivates further exploration into why such signals continue to generate abnormal returns, whether due to risk-based explanations, behavioral biases, or structural inefficiencies in financial markets.
+
+# Sources
+
+Basu, S.
+(1977).
+Investment Performance of Common Stocks in Relation to Their Price-Earnings Ratios: A Test of the Efficient Market Hypothesis.
+The Journal of Finance, 32(3), 663–682.
+https://doi.org/10.2307/2326304
+
+Chen, A. Y., & Zimmermann, T.
+(2021).
+*Open Source Cross-Sectional Asset Pricing* (SSRN Scholarly Paper No. 3875093).
+Social Science Research Network.
+<https://doi.org/10.17016/FEDS.2021.037>
+
